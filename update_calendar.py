@@ -1,219 +1,232 @@
-import json
-import urllib.request
+#!/usr/bin/env python3
+"""Build motogp.ics from the official MotoGP (PulseLive) API.
+
+- Only Qualifying (Q1/Q2) and the Sunday Grand Prix race are included
+  (Sprint is optional, see INCLUDE_SPRINT).
+- All times are converted to IST (Asia/Kolkata).
+- Every event gets an alert 30 minutes before the start.
+- If the API fails or returns nothing, the existing .ics is left untouched.
+"""
+import sys
+import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from zoneinfo import ZoneInfo
 
-OUTPUT_FILE = "motogp.ics"
+import requests
 
-DATA_URL = (
-    "https://cdn.jsdelivr.net/gh/"
-    "vishwapramuditha/moto-db@main/"
-    "data/motogp/{year}/schedule.json"
-)
+# ----------------------------- settings ------------------------------------
+BASE = "https://api.motogp.pulselive.com/motogp/v1"
+OUTPUT = "motogp.ics"
+CAL_NAME = "MotoGP (Qualifying + Race)"
+IST = ZoneInfo("Asia/Kolkata")
+ALARM_MINUTES = 30
+
+INCLUDE_Q1 = True        # Q1 is the 15-min session for riders outside the top 10
+INCLUDE_SPRINT = False   # Saturday sprint race; you asked for GP races only
+
+# calendar block length in minutes (just for how long it shows in your calendar)
+DURATION = {"Q1": 30, "Q2": 30, "RAC": 60, "SPR": 45}
+
+LABEL = {
+    "Q1": "Qualifying Q1",
+    "Q2": "Qualifying Q2",
+    "RAC": "Grand Prix Race",
+    "SPR": "Sprint",
+}
+EMOJI = {"Q1": "⏱️", "Q2": "⏱️", "RAC": "🏁", "SPR": "⚡"}
+# ---------------------------------------------------------------------------
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (motogp-calendar-bot)",
+    "Accept": "application/json",
+    "Origin": "https://www.motogp.com",
+    "Referer": "https://www.motogp.com/",
+}
 
 
-def fetch_schedule(year):
-    url = DATA_URL.format(year=year)
+def api_get(path, **params):
+    """GET with a few retries. Returns parsed JSON (list or dict)."""
+    url = f"{BASE}{path}"
+    last = None
+    for attempt in range(4):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict):
+                for key in ("results", "data", "items"):
+                    if isinstance(data.get(key), list):
+                        return data[key]
+            return data
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"GET {url} failed: {last}")
 
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "MotoGP-Calendar/1.0"},
-    )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+def get_motogp_category(season_uuid):
+    for c in api_get("/results/categories", seasonUuid=season_uuid):
+        name = (c.get("name") or "").lower()
+        if name.startswith("motogp") and not any(x in name for x in ("moto2", "moto3", "e-")):
+            return c["id"]
+    return None
 
 
-def escape_ics(value):
+def classify(s):
+    """Return 'Q1' | 'Q2' | 'RAC' | 'SPR' or None for sessions we skip."""
+    t = (s.get("type") or "").upper()
+    short = (s.get("session_shortname") or "").upper()
+    name = (s.get("name") or "").lower()
+
+    if t == "SPR" or "sprint" in name or short == "SPR":
+        return "SPR"
+    if t == "RAC" or short == "RAC" or name.strip() in ("race", "grand prix", "grand prix race"):
+        return "RAC"
+    if t == "Q" or "qualifying" in name:
+        if "Q1" in short or "q1" in name or "nr. 1" in name or s.get("number") == 1:
+            return "Q1"
+        return "Q2"
+    return None  # practice, warm-up, etc.
+
+
+def parse_dt(value):
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST)
+
+
+def esc(text):
     return (
-        str(value)
-        .replace("\\", "\\\\")
-        .replace(";", "\\;")
-        .replace(",", "\\,")
-        .replace("\n", "\\n")
+        str(text).replace("\\", "\\\\").replace(";", "\\;")
+        .replace(",", "\\,").replace("\n", "\\n")
     )
 
 
-def parse_session(session):
-    date = session.get("date")
-    time = session.get("time")
-
-    if not date or not time:
-        return None
-
-    value = f"{date}T{time}"
-
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-
-    parsed = datetime.fromisoformat(value)
-
-    if parsed.tzinfo is None:
-        return None
-
-    return parsed.astimezone(timezone.utc)
+def fold(line):
+    """RFC 5545 line folding at 75 octets."""
+    raw = line.encode("utf-8")
+    if len(raw) <= 75:
+        return line
+    out, cur = [], b""
+    for ch in line:
+        b = ch.encode("utf-8")
+        limit = 75 if not out else 74
+        if len(cur) + len(b) > limit:
+            out.append(cur.decode("utf-8"))
+            cur = b
+        else:
+            cur += b
+    out.append(cur.decode("utf-8"))
+    return "\r\n ".join(out)
 
 
-def get_events(data):
-    if isinstance(data, list):
-        return data
+def collect_sessions():
+    now = datetime.now(IST)
+    seasons = api_get("/results/seasons")
+    wanted_years = {now.year, now.year + 1}  # next season appears once published
+    rows = []
 
-    if isinstance(data, dict):
-        for key in ("events", "races", "schedule", "rounds"):
-            if isinstance(data.get(key), list):
-                return data[key]
+    for season in seasons:
+        if season.get("year") not in wanted_years:
+            continue
+        cat = get_motogp_category(season["id"])
+        if not cat:
+            continue
+        events = api_get("/results/events", seasonUuid=season["id"], isFinished="false")
+        events += api_get("/results/events", seasonUuid=season["id"], isFinished="true")
+        seen = set()
+        for ev in events:
+            if ev["id"] in seen or ev.get("test") or (ev.get("kind") or "").upper() == "TEST":
+                continue
+            seen.add(ev["id"])
+            for s in api_get("/results/sessions", eventUuid=ev["id"], categoryUuid=cat):
+                kind = classify(s)
+                if kind is None or not s.get("date"):
+                    continue
+                if kind == "Q1" and not INCLUDE_Q1:
+                    continue
+                if kind == "SPR" and not INCLUDE_SPRINT:
+                    continue
+                rows.append((ev, s, kind))
+    return rows
 
-    return []
 
+def build_ics(rows):
+    now_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//motogp-calendar//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        f"X-WR-CALNAME:{esc(CAL_NAME)}",
+        "X-WR-TIMEZONE:Asia/Kolkata",
+        "REFRESH-INTERVAL;VALUE=DURATION:PT6H",
+        "X-PUBLISHED-TTL:PT6H",
+        # IST has no DST, so one fixed observance is enough
+        "BEGIN:VTIMEZONE",
+        "TZID:Asia/Kolkata",
+        "BEGIN:STANDARD",
+        "DTSTART:19700101T000000",
+        "TZOFFSETFROM:+0530",
+        "TZOFFSETTO:+0530",
+        "TZNAME:IST",
+        "END:STANDARD",
+        "END:VTIMEZONE",
+    ]
 
-def get_location(event):
-    circuit = event.get("circuit", event.get("track", ""))
+    for ev, s, kind in sorted(rows, key=lambda r: r[1]["date"]):
+        start = parse_dt(s["date"])
+        end = start + timedelta(minutes=DURATION[kind])
+        gp_name = ev.get("short_name") or ev.get("name") or "MotoGP"
+        circuit = ev.get("circuit") or {}
+        country = (ev.get("country") or {}).get("name") or circuit.get("nation") or ""
+        location = ", ".join(x for x in (circuit.get("name"), circuit.get("place"), country) if x)
 
-    if isinstance(circuit, dict):
-        return (
-            circuit.get("name")
-            or circuit.get("circuitName")
-            or ""
+        summary = f"{EMOJI[kind]} MotoGP {LABEL[kind]} – {gp_name}"
+        desc = (
+            f"{ev.get('name', gp_name)}\n{LABEL[kind]}\n"
+            f"Starts {start.strftime('%a %d %b %Y, %I:%M %p')} IST"
         )
 
-    return str(circuit or "")
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{s['id']}@motogp-calendar",
+            f"DTSTAMP:{now_utc}",
+            f"DTSTART;TZID=Asia/Kolkata:{start.strftime('%Y%m%dT%H%M%S')}",
+            f"DTEND;TZID=Asia/Kolkata:{end.strftime('%Y%m%dT%H%M%S')}",
+            f"SUMMARY:{esc(summary)}",
+            f"LOCATION:{esc(location)}",
+            f"DESCRIPTION:{esc(desc)}",
+            "BEGIN:VALARM",
+            "ACTION:DISPLAY",
+            f"DESCRIPTION:{esc(summary)} starts in {ALARM_MINUTES} minutes",
+            f"TRIGGER:-PT{ALARM_MINUTES}M",
+            "END:VALARM",
+            "END:VEVENT",
+        ]
 
-
-def create_event(uid, title, start, duration, location):
-    end = start + timedelta(minutes=duration)
-
-    return [
-        "BEGIN:VEVENT",
-        f"UID:{uid}@motogp-calendar",
-        f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
-        f"DTSTART:{start.strftime('%Y%m%dT%H%M%SZ')}",
-        f"DTEND:{end.strftime('%Y%m%dT%H%M%SZ')}",
-        f"SUMMARY:{escape_ics(title)}",
-        f"LOCATION:{escape_ics(location)}",
-        "BEGIN:VALARM",
-        "TRIGGER:-PT30M",
-        "ACTION:DISPLAY",
-        f"DESCRIPTION:{escape_ics(title)} starts in 30 minutes",
-        "END:VALARM",
-        "END:VEVENT",
-    ]
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(fold(l) for l in lines) + "\r\n"
 
 
 def main():
-    now = datetime.now(timezone.utc)
-    current_year = now.year
-    calendar_events = []
-    seen_ids = set()
+    try:
+        rows = collect_sessions()
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    if not rows:
+        print("ERROR: no sessions found, keeping existing calendar", file=sys.stderr)
+        return 1
 
-    for year in (current_year, current_year + 1):
-        try:
-            data = fetch_schedule(year)
-        except Exception as error:
-            print(f"Could not fetch {year} schedule: {error}")
-            continue
-
-        events = get_events(data)
-
-        if not events:
-            print(f"No recognizable events found for {year}.")
-            continue
-
-        for event in events:
-            event_name = (
-                event.get("name")
-                or event.get("eventName")
-                or event.get("grandPrix")
-                or event.get("raceName")
-                or f"MotoGP event {event.get('round', '')}"
-            )
-
-            location = get_location(event)
-
-            sessions = event.get("sessions", [])
-
-            if not isinstance(sessions, list):
-                continue
-
-            for session in sessions:
-                session_type = str(
-                    session.get("type", "")
-                ).strip().lower()
-
-                session_name = str(
-                    session.get("name", "")
-                ).strip().lower()
-
-                # Include qualifying sessions, including Q1 and Q2.
-                is_qualifying = (
-                    session_type in ("qualifying", "q1", "q2")
-                    or session_name in (
-                        "qualifying",
-                        "qualifying 1",
-                        "qualifying 2",
-                        "q1",
-                        "q2",
-                    )
-                )
-
-                # Include the main race, but never the Sprint race.
-                is_main_race = (
-                    session_type == "race"
-                    or session_name in ("race", "motogp race")
-                )
-
-                if not (is_qualifying or is_main_race):
-                    continue
-
-                start = parse_session(session)
-
-                if start is None or start <= now:
-                    continue
-
-                label = "Qualifying" if is_qualifying else "Grand Prix"
-
-                session_id = (
-                    session.get("id")
-                    or f"{year}-{event_name}-{session_type}-{start.isoformat()}"
-                )
-
-                uid = f"{year}-{session_id}"
-
-                if uid in seen_ids:
-                    continue
-
-                seen_ids.add(uid)
-
-                duration = 60 if is_qualifying else 120
-
-                calendar_events.extend(
-                    create_event(
-                        uid,
-                        f"MotoGP {event_name} - {label}",
-                        start,
-                        duration,
-                        location,
-                    )
-                )
-
-    calendar = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//MotoGP Calendar//EN",
-        "CALSCALE:GREGORIAN",
-        "X-WR-CALNAME:MotoGP - Qualifying & Grand Prix",
-        *calendar_events,
-        "END:VCALENDAR",
-        "",
-    ]
-
-    Path(OUTPUT_FILE).write_text(
-        "\r\n".join(calendar),
-        encoding="utf-8",
-    )
-
-    print(f"Generated {OUTPUT_FILE}")
-    print(f"Upcoming sessions included: {len(seen_ids)}")
+    ics = build_ics(rows)
+    with open(OUTPUT, "w", encoding="utf-8", newline="") as f:
+        f.write(ics)
+    print(f"Wrote {len(rows)} sessions to {OUTPUT}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
